@@ -1,0 +1,43 @@
+# Baseline & Personal scan data (DO NOT SHARE / COMMIT)
+clean.json
+compare.json
+target.json
+infected.json
+*.json
+!package.json
+
+# Scan result directories & dumps
+clean/
+compare/
+infected/
+scan_results_*/
+*.csv
+
+# Generated Office Reports
+*.docx
+*.xlsx
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Executables & Binaries
+*.exe
+*.bin
+*.dll
+*.o
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
