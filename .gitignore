@@ -3,8 +3,16 @@ clean.json
 compare.json
 target.json
 infected.json
+threat_intel_cache.json
+vt_config.json
 *.json
 !package.json
+
+# API Keys & Local Secrets (DO NOT SHARE / COMMIT)
+.env
+*.env
+config.env
+secrets/
 
 # Scan result directories & dumps
 clean/
@@ -12,6 +20,7 @@ compare/
 infected/
 scan_results_*/
 *.csv
+*.html
 
 # Generated Office Reports
 *.docx
@@ -23,11 +32,14 @@ __pycache__/
 *$py.class
 *.so
 
-# Executables & Binaries
+# Executables & PyInstaller Build Artifacts (DO NOT SHARE / COMMIT)
 *.exe
 *.bin
 *.dll
 *.o
+build/
+dist/
+*.spec
 
 # Virtual Environments
 .venv/
@@ -41,4 +53,3 @@ env/
 *.swp
 .DS_Store
 Thumbs.db
-

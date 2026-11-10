@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-UNIFIED FILESYSTEM SCANNER AND INTEGRITY CHECKER (v2.0 Enhanced)
+UNIFIED FILESYSTEM SCANNER AND INTEGRITY CHECKER (v2.0 Forensic Edition)
 ================================================================================
 An agentless, forensic-grade filesystem auditing and differential analysis tool.
 
 Core Features:
 - Dual-Stream Hashing (MD5 + SHA-256 in a single 128KB I/O pass)
+- Multi-Source Threat Intelligence (CIRCL Hashlookup + MalwareBazaar + VirusTotal v3)
 - SUID/SGID Privilege Escalation Detection (POSIX/Linux)
 - Cross-Platform Path Normalization (/home/user -> /home/USER, C:\\Users\\user -> C:\\Users\\USER)
 - Critical Security Threat Categorization (modified binaries, drop zones, script drops)
@@ -28,6 +29,9 @@ import hashlib
 import argparse
 import shutil
 import gzip
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -211,7 +215,6 @@ def scan_filesystem(start_path=None, output_file=None, verbose=True, compress=Fa
                 chunk_end = min(chunk_start + chunk_size, total_tasks)
                 chunk_tasks = tasks[chunk_start:chunk_end]
 
-                # Pass task tuple (file_path, max_bytes)
                 future_to_file = {executor.submit(process_file_task, (f, max_bytes)): f for f in chunk_tasks}
 
                 for future in as_completed(future_to_file):
@@ -332,7 +335,10 @@ def compare_scans(clean_scan_file, target_scan_file, output_file=None):
                     'target_size': target_info.get('size_bytes', 'N/A'),
                     'clean_permissions': clean_info.get('permissions', 'N/A'),
                     'target_permissions': target_info.get('permissions', 'N/A'),
-                    'suid_escalation': suid_escalation
+                    'suid_escalation': suid_escalation,
+                    'threat_verdict': 'UNCHECKED',
+                    'threat_details': 'Pending analysis',
+                    'threat_source': 'None'
                 })
         else:
             new_files.append({
@@ -344,7 +350,10 @@ def compare_scans(clean_scan_file, target_scan_file, output_file=None):
                 'modification_datetime': target_info.get('modification_datetime'),
                 'size_bytes': target_info.get('size_bytes', 'N/A'),
                 'permissions': target_info.get('permissions', 'N/A'),
-                'is_suid': target_info.get('is_suid', False)
+                'is_suid': target_info.get('is_suid', False),
+                'threat_verdict': 'UNCHECKED',
+                'threat_details': 'Pending analysis',
+                'threat_source': 'None'
             })
 
     # Check for deleted files
@@ -358,7 +367,10 @@ def compare_scans(clean_scan_file, target_scan_file, output_file=None):
                 'sha256_hash': clean_info.get('sha256_hash', 'N/A'),
                 'modification_datetime': clean_info.get('modification_datetime'),
                 'size_bytes': clean_info.get('size_bytes', 'N/A'),
-                'permissions': clean_info.get('permissions', 'N/A')
+                'permissions': clean_info.get('permissions', 'N/A'),
+                'threat_verdict': 'N/A',
+                'threat_details': 'Deleted from target',
+                'threat_source': 'None'
             })
 
     results = {
@@ -467,6 +479,221 @@ def categorize_findings(comparison_data):
         'deleted': deleted
     }
 
+# ----------------------------------------------------------------------
+# 4. Multi-Source Threat Intelligence (CIRCL + MalwareBazaar + VirusTotal)
+# ----------------------------------------------------------------------
+
+CACHE_FILE = "threat_intel_cache.json"
+
+def load_threat_intel_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+def save_threat_intel_cache(cache):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+def load_threat_intel_config():
+    """
+    Loads VirusTotal API key and settings securely without exposing secrets to Git.
+    Prioritizes:
+    1. vt_config.json (local ignored file)
+    2. VT_API_KEY environment variable
+    """
+    config = {
+        "virustotal_api_key": os.environ.get("VT_API_KEY", ""),
+        "enable_circl": True,
+        "enable_malwarebazaar": True,
+        "rate_limit_seconds": 15
+    }
+    candidates = [
+        "vt_config.json",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "vt_config.json")
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                with open(c, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        config.update(data)
+                        break
+            except Exception:
+                pass
+    return config
+
+_LAST_VT_CALL = 0.0
+
+def query_threat_intel(sha256_hash, md5_hash=None, config=None, cache=None):
+    """
+    Enriches a file hash using free CIRCL Hashlookup, MalwareBazaar, and VirusTotal v3.
+    """
+    global _LAST_VT_CALL
+    target_hash = sha256_hash if (sha256_hash and sha256_hash != 'N/A') else md5_hash
+    if not target_hash or target_hash == 'N/A':
+        return {"verdict": "UNKNOWN", "details": "No Hash Available", "source": "None"}
+
+    if cache is None:
+        cache = load_threat_intel_cache()
+
+    # 1. Local Cache Lookup (0 API cost)
+    if target_hash in cache:
+        return cache[target_hash]
+
+    if config is None:
+        config = load_threat_intel_config()
+
+    # 2. Check CIRCL Hashlookup (NSRL known legitimate OS binaries & KnownMalicious database)
+    if config.get("enable_circl", True):
+        try:
+            lookup_type = "sha256" if len(target_hash) == 64 else "md5"
+            circl_url = f"https://hashlookup.circl.lu/lookup/{lookup_type}/{target_hash}"
+            req = urllib.request.Request(circl_url, headers={"User-Agent": "AntigravityIntegrityScanner/2.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    if "KnownMalicious" in data:
+                        res = {
+                            "verdict": "MALICIOUS",
+                            "details": f"CIRCL Flagged Malware: {data.get('KnownMalicious')}",
+                            "source": "CIRCL Hashlookup"
+                        }
+                        cache[target_hash] = res
+                        save_threat_intel_cache(cache)
+                        return res
+                    elif "FileName" in data or "NSRL" in str(data):
+                        fname = data.get("FileName", "OS Component")
+                        res = {
+                            "verdict": "BENIGN",
+                            "details": f"Verified Known OS Binary ({fname})",
+                            "source": "CIRCL (NSRL)"
+                        }
+                        cache[target_hash] = res
+                        save_threat_intel_cache(cache)
+                        return res
+        except Exception:
+            pass # CIRCL returned 404 (not in database) or timed out
+
+    # 3. Check MalwareBazaar (abuse.ch)
+    if config.get("enable_malwarebazaar", True):
+        try:
+            mb_url = "https://mb-api.abuse.ch/api/v1/"
+            post_data = urllib.parse.urlencode({"query": "get_info", "hash": target_hash}).encode('utf-8')
+            req = urllib.request.Request(mb_url, data=post_data, headers={"User-Agent": "AntigravityIntegrityScanner/2.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                if data.get("query_status") == "ok":
+                    first_hit = data.get("data", [{}])[0]
+                    sig = first_hit.get("signature", "Generic Malware")
+                    ftype = first_hit.get("file_type", "Executable")
+                    res = {
+                        "verdict": "MALICIOUS",
+                        "details": f"MalwareBazaar: {sig} ({ftype})",
+                        "source": "MalwareBazaar"
+                    }
+                    cache[target_hash] = res
+                    save_threat_intel_cache(cache)
+                    return res
+        except Exception:
+            pass
+
+    # 4. Check VirusTotal (Only for unresolved files, rate-limit protected)
+    vt_key = config.get("virustotal_api_key", "").strip()
+    if vt_key and len(target_hash) in (32, 64):
+        try:
+            # Enforce 15-second pacing for the 4 calls/minute free tier limit
+            rate_limit = config.get("rate_limit_seconds", 15)
+            elapsed = time.time() - _LAST_VT_CALL
+            if elapsed < rate_limit and _LAST_VT_CALL > 0:
+                time.sleep(rate_limit - elapsed)
+
+            _LAST_VT_CALL = time.time()
+            vt_url = f"https://www.virustotal.com/api/v3/files/{target_hash}"
+            req = urllib.request.Request(vt_url, headers={
+                "x-apikey": vt_key,
+                "User-Agent": "AntigravityIntegrityScanner/2.0"
+            })
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if resp.status == 200:
+                    vt_data = json.loads(resp.read().decode('utf-8'))
+                    stats = vt_data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+                    malicious = stats.get('malicious', 0)
+                    suspicious = stats.get('suspicious', 0)
+                    total = sum(stats.values())
+
+                    if malicious > 0:
+                        verdict = "MALICIOUS"
+                        details = f"VirusTotal: {malicious}/{total} AV Detections"
+                    elif suspicious > 0:
+                        verdict = "SUSPICIOUS"
+                        details = f"VirusTotal: {suspicious}/{total} Suspicious Flags"
+                    else:
+                        verdict = "BENIGN"
+                        details = f"VirusTotal: Clean (0/{total} Detections)"
+
+                    res = {
+                        "verdict": verdict,
+                        "details": details,
+                        "source": "VirusTotal"
+                    }
+                    cache[target_hash] = res
+                    save_threat_intel_cache(cache)
+                    return res
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                res = {
+                    "verdict": "UNKNOWN",
+                    "details": "VirusTotal: Hash not seen before in VT database",
+                    "source": "VirusTotal"
+                }
+                cache[target_hash] = res
+                save_threat_intel_cache(cache)
+                return res
+        except Exception:
+            pass
+
+    return {"verdict": "UNKNOWN", "details": "Not listed in CIRCL/MalwareBazaar", "source": "None"}
+
+def enrich_findings_with_threat_intel(comparison_data, config=None):
+    """
+    Enriches CRITICAL and HIGH severity findings using CIRCL, MalwareBazaar, and VirusTotal.
+    Saves API quota by only investigating high-risk items.
+    """
+    cat = categorize_findings(comparison_data)
+    candidates = cat['mod_binaries'] + cat['suid_findings'] + cat['suspicious_new']
+    
+    if not candidates:
+        return
+        
+    if config is None:
+        config = load_threat_intel_config()
+
+    print(f"\n[*] Enriching {len(candidates)} Critical/High findings with Threat Intelligence...")
+    print(f"    (CIRCL Hashlookup + MalwareBazaar" + (" + VirusTotal v3)" if config.get('virustotal_api_key') else ")"))
+
+    cache = load_threat_intel_cache()
+    for item in candidates:
+        sha = item.get('target_sha256') or item.get('sha256_hash')
+        md5 = item.get('target_md5') or item.get('md5_hash')
+        
+        intel = query_threat_intel(sha, md5_hash=md5, config=config, cache=cache)
+        item['threat_verdict'] = intel.get('verdict', 'UNKNOWN')
+        item['threat_details'] = intel.get('details', 'N/A')
+        item['threat_source'] = intel.get('source', 'None')
+        
+        tag = f"[{item['threat_verdict']}]"
+        print(f"    - {item.get('normalized_path')}: {tag} {item['threat_details']} ({item['threat_source']})")
+
 def print_critical_report(comparison_data):
     """Display an executive terminal summary of critical security findings."""
     cat = categorize_findings(comparison_data)
@@ -496,18 +723,22 @@ def print_critical_report(comparison_data):
         print("    (File gained SUID root execution bit!)")
         print("-"*80)
         for i, f in enumerate(suid_f, 1):
-            print(f"[{i}] {f['normalized_path']} (Perms: {f.get('target_permissions')})")
+            intel_disp = f" | [{f.get('threat_verdict')}] {f.get('threat_details')}" if f.get('threat_verdict') not in ('UNCHECKED', None) else ""
+            print(f"[{i}] {f['normalized_path']} (Perms: {f.get('target_permissions')}){intel_disp}")
 
     if susp_new:
         print(f"\n1. SUSPICIOUS NEW FILES ({len(susp_new)} detected):")
         print("   (Executable extensions, drop zones, or hidden scripts)")
         print("-"*80)
         for i, f in enumerate(susp_new[:15], 1):
+            intel_disp = f" | [{f.get('threat_verdict')}] {f.get('threat_details')}" if f.get('threat_verdict') not in ('UNCHECKED', None) else ""
             print(f"[{i}] {f['normalized_path']}")
             print(f"    Size:     {format_size(f.get('size_bytes'))}")
             print(f"    MD5:      {f.get('md5_hash')}")
             if f.get('sha256_hash') and f.get('sha256_hash') != 'N/A':
                 print(f"    SHA-256:  {f.get('sha256_hash')}")
+            if intel_disp:
+                print(f"    Intel:   {intel_disp}")
             print(f"    Created:  {f.get('modification_datetime')}")
         if len(susp_new) > 15:
             print(f"    ... and {len(susp_new) - 15} more (see CSV / HTML reports).")
@@ -517,11 +748,14 @@ def print_critical_report(comparison_data):
         print("   (Hash mismatch in system executable directories - potential tampering!)")
         print("-"*80)
         for i, f in enumerate(mod_bin[:15], 1):
+            intel_disp = f" | [{f.get('threat_verdict')}] {f.get('threat_details')}" if f.get('threat_verdict') not in ('UNCHECKED', None) else ""
             print(f"[{i}] {f['normalized_path']}")
             print(f"    Clean MD5:  {f.get('clean_md5')}")
             print(f"    Target MD5: {f.get('target_md5')}")
             if f.get('target_sha256') and f.get('target_sha256') != 'N/A':
                 print(f"    Target SHA: {f.get('target_sha256')}")
+            if intel_disp:
+                print(f"    Intel:     {intel_disp}")
         if len(mod_bin) > 15:
             print(f"    ... and {len(mod_bin) - 15} more (see CSV / HTML reports).")
 
@@ -530,11 +764,11 @@ def print_critical_report(comparison_data):
     print("="*80 + "\n")
 
 # ----------------------------------------------------------------------
-# 4. CSV & Interactive HTML Reporting
+# 5. CSV & Interactive HTML Reporting
 # ----------------------------------------------------------------------
 
 def generate_csv_report(comparison_data, output_csv):
-    """Exports structured findings into a CSV report with severity tags."""
+    """Exports structured findings into a CSV report with severity and threat intel tags."""
     cat = categorize_findings(comparison_data)
     rows = []
 
@@ -546,6 +780,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'Modified (SUID)',
             'Size': f.get('target_size', 0),
+            'Threat Intel Verdict': f.get('threat_verdict', 'N/A'),
+            'Threat Intel Details': f.get('threat_details', 'N/A'),
             'Clean MD5': f.get('clean_md5', 'Unknown'),
             'Target MD5': f.get('target_md5', 'Unknown'),
             'Clean SHA256': f.get('clean_sha256', 'N/A'),
@@ -562,6 +798,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'New',
             'Size': f.get('size_bytes', 0),
+            'Threat Intel Verdict': f.get('threat_verdict', 'N/A'),
+            'Threat Intel Details': f.get('threat_details', 'N/A'),
             'Clean MD5': 'N/A',
             'Target MD5': f.get('md5_hash', 'Unknown'),
             'Clean SHA256': 'N/A',
@@ -577,6 +815,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'Modified',
             'Size': f.get('target_size', 0),
+            'Threat Intel Verdict': f.get('threat_verdict', 'N/A'),
+            'Threat Intel Details': f.get('threat_details', 'N/A'),
             'Clean MD5': f.get('clean_md5', 'Unknown'),
             'Target MD5': f.get('target_md5', 'Unknown'),
             'Clean SHA256': f.get('clean_sha256', 'N/A'),
@@ -592,6 +832,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'Modified',
             'Size': f.get('target_size', 0),
+            'Threat Intel Verdict': f.get('threat_verdict', 'N/A'),
+            'Threat Intel Details': f.get('threat_details', 'N/A'),
             'Clean MD5': f.get('clean_md5', 'Unknown'),
             'Target MD5': f.get('target_md5', 'Unknown'),
             'Clean SHA256': f.get('clean_sha256', 'N/A'),
@@ -607,6 +849,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'New',
             'Size': f.get('size_bytes', 0),
+            'Threat Intel Verdict': f.get('threat_verdict', 'N/A'),
+            'Threat Intel Details': f.get('threat_details', 'N/A'),
             'Clean MD5': 'N/A',
             'Target MD5': f.get('md5_hash', 'Unknown'),
             'Clean SHA256': 'N/A',
@@ -622,6 +866,8 @@ def generate_csv_report(comparison_data, output_csv):
             'Path': f['normalized_path'],
             'Status': 'Deleted',
             'Size': f.get('size_bytes', 0),
+            'Threat Intel Verdict': 'N/A',
+            'Threat Intel Details': 'Deleted from target',
             'Clean MD5': f.get('md5_hash', 'Unknown'),
             'Target MD5': 'N/A',
             'Clean SHA256': f.get('sha256_hash', 'N/A'),
@@ -631,7 +877,8 @@ def generate_csv_report(comparison_data, output_csv):
 
     fieldnames = [
         'Category', 'Suggested Severity', 'Path', 'Status',
-        'Size', 'Clean MD5', 'Target MD5', 'Clean SHA256', 'Target SHA256', 'Modification Time'
+        'Size', 'Threat Intel Verdict', 'Threat Intel Details',
+        'Clean MD5', 'Target MD5', 'Clean SHA256', 'Target SHA256', 'Modification Time'
     ]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
@@ -645,7 +892,7 @@ def generate_csv_report(comparison_data, output_csv):
 def generate_html_report(comparison_data, output_html):
     """
     Generates a modern, self-contained, interactive HTML dashboard report
-    with embedded client-side search, severity filters, and responsive styling.
+    with embedded client-side search, severity filters, threat intel badges, and responsive styling.
     Zero external dependencies (requires no internet connection or CDN).
     """
     cat = categorize_findings(comparison_data)
@@ -658,7 +905,6 @@ def generate_html_report(comparison_data, output_html):
     high_count = len(cat['suspicious_new'])
     total_diffs = mod_count + new_count + del_count
 
-    # Build rows JSON data for embedding safely
     table_rows = []
 
     # SUID Findings
@@ -667,6 +913,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'SUID Escalation',
             'severity': 'CRITICAL',
             'status': 'Modified (SUID)',
+            'threat': f.get('threat_verdict', 'N/A'),
+            'threat_detail': f.get('threat_details', 'N/A'),
             'path': f['normalized_path'],
             'size': format_size(f.get('target_size', 0)),
             'target_hash': f.get('target_sha256', f.get('target_md5', 'N/A')),
@@ -680,6 +928,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'Modified Binary',
             'severity': 'CRITICAL',
             'status': 'Modified',
+            'threat': f.get('threat_verdict', 'N/A'),
+            'threat_detail': f.get('threat_details', 'N/A'),
             'path': f['normalized_path'],
             'size': format_size(f.get('target_size', 0)),
             'target_hash': f.get('target_sha256', f.get('target_md5', 'N/A')),
@@ -694,6 +944,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'Suspicious Script/File',
             'severity': sev,
             'status': 'New',
+            'threat': f.get('threat_verdict', 'N/A'),
+            'threat_detail': f.get('threat_details', 'N/A'),
             'path': f['normalized_path'],
             'size': format_size(f.get('size_bytes', 0)),
             'target_hash': f.get('sha256_hash', f.get('md5_hash', 'N/A')),
@@ -707,6 +959,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'Modified File',
             'severity': 'MEDIUM',
             'status': 'Modified',
+            'threat': f.get('threat_verdict', 'N/A'),
+            'threat_detail': f.get('threat_details', 'N/A'),
             'path': f['normalized_path'],
             'size': format_size(f.get('target_size', 0)),
             'target_hash': f.get('target_sha256', f.get('target_md5', 'N/A')),
@@ -720,6 +974,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'New File',
             'severity': 'LOW',
             'status': 'New',
+            'threat': f.get('threat_verdict', 'N/A'),
+            'threat_detail': f.get('threat_details', 'N/A'),
             'path': f['normalized_path'],
             'size': format_size(f.get('size_bytes', 0)),
             'target_hash': f.get('sha256_hash', f.get('md5_hash', 'N/A')),
@@ -733,6 +989,8 @@ def generate_html_report(comparison_data, output_html):
             'category': 'Deleted File',
             'severity': 'MEDIUM',
             'status': 'Deleted',
+            'threat': 'N/A',
+            'threat_detail': 'Deleted from target',
             'path': f['normalized_path'],
             'size': format_size(f.get('size_bytes', 0)),
             'target_hash': 'N/A',
@@ -747,7 +1005,7 @@ def generate_html_report(comparison_data, output_html):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Filesystem Integrity Audit Report</title>
+<title>Filesystem Integrity & Threat Intel Audit Report</title>
 <style>
   :root {{
     --bg-main: #0d1117;
@@ -903,6 +1161,11 @@ def generate_html_report(comparison_data, output_html):
   .badge-MEDIUM {{ background: rgba(227, 179, 65, 0.2); color: var(--med); border: 1px solid var(--med); }}
   .badge-LOW {{ background: rgba(63, 185, 80, 0.2); color: var(--low); border: 1px solid var(--low); }}
 
+  .badge-MALICIOUS {{ background: rgba(248, 81, 73, 0.25); color: #ff7b72; border: 1px solid #ff7b72; }}
+  .badge-SUSPICIOUS {{ background: rgba(210, 153, 34, 0.25); color: #e3b341; border: 1px solid #e3b341; }}
+  .badge-BENIGN {{ background: rgba(63, 185, 80, 0.25); color: #56d364; border: 1px solid #56d364; }}
+  .badge-UNKNOWN {{ background: rgba(139, 148, 158, 0.2); color: var(--text-muted); border: 1px solid var(--text-muted); }}
+
   .hash-code {{
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     font-size: 0.76rem;
@@ -911,7 +1174,7 @@ def generate_html_report(comparison_data, output_html):
     border-radius: 4px;
     color: #e6edf3;
     display: inline-block;
-    max-width: 280px;
+    max-width: 250px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -920,7 +1183,7 @@ def generate_html_report(comparison_data, output_html):
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     font-size: 0.82rem;
     word-break: break-all;
-    max-width: 450px;
+    max-width: 400px;
   }}
 </style>
 </head>
@@ -928,7 +1191,7 @@ def generate_html_report(comparison_data, output_html):
 
 <div class="container">
   <header>
-    <h1>🛡️ Filesystem Integrity & Forensic Audit Report</h1>
+    <h1>🛡️ Filesystem Integrity & Threat Intel Audit Report</h1>
     <div class="meta-grid">
       <span><strong>Analysis Timestamp:</strong> {comparison_data.get('analysis_timestamp', 'Unknown')}</span>
       <span><strong>Clean Baseline:</strong> {os.path.basename(str(comparison_data.get('clean_scan_file', '')))}</span>
@@ -967,7 +1230,7 @@ def generate_html_report(comparison_data, output_html):
 
   <div class="controls">
     <div class="search-box">
-      <input type="text" id="searchInput" placeholder="Search paths, filenames, hashes..." onkeyup="filterData()">
+      <input type="text" id="searchInput" placeholder="Search paths, filenames, hashes, threat details..." onkeyup="filterData()">
     </div>
     <div class="select-box">
       <select id="severityFilter" onchange="filterData()">
@@ -976,6 +1239,14 @@ def generate_html_report(comparison_data, output_html):
         <option value="HIGH">High Only</option>
         <option value="MEDIUM">Medium Only</option>
         <option value="LOW">Low Only</option>
+      </select>
+    </div>
+    <div class="select-box">
+      <select id="threatFilter" onchange="filterData()">
+        <option value="ALL">All Threat Verdicts</option>
+        <option value="MALICIOUS">Malicious Only</option>
+        <option value="SUSPICIOUS">Suspicious Only</option>
+        <option value="BENIGN">Benign Only</option>
       </select>
     </div>
     <div class="select-box">
@@ -994,6 +1265,7 @@ def generate_html_report(comparison_data, output_html):
       <thead>
         <tr>
           <th>Severity</th>
+          <th>Threat Intel</th>
           <th>Category</th>
           <th>Normalized Path</th>
           <th>Status</th>
@@ -1014,20 +1286,24 @@ def generate_html_report(comparison_data, output_html):
   function renderTable(items) {{
     const tbody = document.getElementById('tableBody');
     if (items.length === 0) {{
-      tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 40px; color: var(--text-muted);">No matching entries found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; padding: 40px; color: var(--text-muted);">No matching entries found.</td></tr>';
       document.getElementById('rowCount').innerText = 'Showing 0 records';
       return;
     }}
 
-    // Limit initial display to first 1000 items to guarantee smooth browser performance
     const renderLimit = 1000;
     const slice = items.slice(0, renderLimit);
     
     let html = '';
     for (let i = 0; i < slice.length; i++) {{
       const r = slice[i];
+      const threatBadge = r.threat && r.threat !== 'N/A' && r.threat !== 'UNCHECKED'
+        ? `<span class="badge badge-${{r.threat}}" title="${{r.threat_detail}}">${{r.threat}}</span><br><small style="color:var(--text-muted);font-size:0.75rem;">${{r.threat_detail}}</small>`
+        : '<span style="color:var(--text-muted);font-size:0.78rem;">-</span>';
+
       html += `<tr>
         <td><span class="badge badge-${{r.severity}}">${{r.severity}}</span></td>
+        <td>${{threatBadge}}</td>
         <td>${{r.category}}</td>
         <td class="path-cell" title="${{r.path}}">${{r.path}}</td>
         <td>${{r.status}}</td>
@@ -1045,19 +1321,20 @@ def generate_html_report(comparison_data, output_html):
   function filterData() {{
     const query = document.getElementById('searchInput').value.toLowerCase().trim();
     const sev = document.getElementById('severityFilter').value;
+    const thr = document.getElementById('threatFilter').value;
     const stat = document.getElementById('statusFilter').value;
 
     const filtered = data.filter(r => {{
-      const matchQuery = !query || r.path.toLowerCase().includes(query) || r.target_hash.toLowerCase().includes(query) || r.category.toLowerCase().includes(query);
+      const matchQuery = !query || r.path.toLowerCase().includes(query) || r.target_hash.toLowerCase().includes(query) || r.category.toLowerCase().includes(query) || (r.threat_detail && r.threat_detail.toLowerCase().includes(query));
       const matchSev = (sev === 'ALL') || (r.severity === sev);
+      const matchThr = (thr === 'ALL') || (r.threat === thr);
       const matchStat = (stat === 'ALL') || (r.status.startsWith(stat));
-      return matchQuery && matchSev && matchStat;
+      return matchQuery && matchSev && matchThr && matchStat;
     }});
 
     renderTable(filtered);
   }}
 
-  // Initial render
   renderTable(data);
 </script>
 </body>
@@ -1070,7 +1347,7 @@ def generate_html_report(comparison_data, output_html):
     print(f"[+] Successfully generated Interactive HTML Report: {output_html}")
 
 # ----------------------------------------------------------------------
-# 5. Baseline File Discovery
+# 6. Baseline File Discovery
 # ----------------------------------------------------------------------
 
 def find_clean_json():
@@ -1100,7 +1377,7 @@ def find_clean_json():
     return None
 
 # ----------------------------------------------------------------------
-# 6. Workflow Procedures
+# 7. Workflow Procedures
 # ----------------------------------------------------------------------
 
 def workflow_baseline_scan(scan_path=None, compress=False, max_file_mb=None):
@@ -1118,8 +1395,8 @@ def workflow_baseline_scan(scan_path=None, compress=False, max_file_mb=None):
         print("\n[-] Error: Failed to generate baseline scan.")
         return None
 
-def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compress=False, max_file_mb=None):
-    """Runs target scan, compares against baseline, and outputs CSV + HTML reports."""
+def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compress=False, max_file_mb=None, skip_intel=False):
+    """Runs target scan, compares against baseline, enriches with Threat Intel, and outputs CSV + HTML reports."""
     print("\n" + "="*70)
     print("STEP 2: SCANNING TARGET SYSTEM & COMPARING WITH BASELINE".center(70))
     print("="*70)
@@ -1157,6 +1434,9 @@ def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compres
         print("[-] Comparison failed.")
         return
 
+    if not skip_intel:
+        enrich_findings_with_threat_intel(comparison)
+
     print(f"[+] Diff comparison saved to: {compare_json}")
     generate_csv_report(comparison, csv_report)
     generate_html_report(comparison, html_report)
@@ -1165,8 +1445,8 @@ def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compres
     print(f"[*] All results stored in folder: {outcome_dir}")
     print(f"[*] Open HTML Report in browser: file:///{os.path.abspath(html_report).replace(os.sep, '/')}")
 
-def workflow_compare_existing(clean_path, target_path, output_csv=None, output_json=None, output_html=None):
-    """Directly compares two existing scan JSON files and outputs CSV + HTML reports."""
+def workflow_compare_existing(clean_path, target_path, output_csv=None, output_json=None, output_html=None, skip_intel=False):
+    """Directly compares two existing scan JSON files, enriches with Threat Intel, and outputs CSV + HTML reports."""
     print("\n" + "="*70)
     print("COMPARING EXISTING SCAN FILES".center(70))
     print(f"Clean:  {clean_path}")
@@ -1180,6 +1460,9 @@ def workflow_compare_existing(clean_path, target_path, output_csv=None, output_j
     comparison = compare_scans(clean_path, target_path, output_file=output_json)
     if not comparison:
         return
+
+    if not skip_intel:
+        enrich_findings_with_threat_intel(comparison)
 
     if not output_csv:
         output_csv = output_json.replace(".json.gz", "").replace(".json", "") + "_findings.csv"
@@ -1221,7 +1504,7 @@ def view_json_summary(file_path):
         print("Unknown JSON format.")
 
 # ----------------------------------------------------------------------
-# 7. Interactive Menu & CLI Dispatcher
+# 8. Interactive Menu & CLI Dispatcher
 # ----------------------------------------------------------------------
 
 def interactive_menu():
@@ -1299,6 +1582,8 @@ def main():
     parser.add_argument("--path", help="Custom path to scan (defaults to C:\\ or /)")
     parser.add_argument("--compress", action="store_true", help="Save scan snapshots with Gzip compression (.json.gz)")
     parser.add_argument("--max-size-mb", type=float, help="Cap hash hashing at max MB per file (skips massive ISO/VMDK)")
+    parser.add_argument("--skip-intel", action="store_true", help="Skip Threat Intelligence lookups (offline mode)")
+    parser.add_argument("--vt-key", help="Override VirusTotal API key")
     parser.add_argument("--output-csv", help="Custom path for output CSV report")
     parser.add_argument("--output-html", help="Custom path for interactive HTML dashboard")
     parser.add_argument("--output-json", help="Custom path for output comparison JSON")
@@ -1309,14 +1594,15 @@ def main():
     if args.baseline:
         workflow_baseline_scan(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb)
     elif args.target:
-        workflow_target_scan_and_compare(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb)
+        workflow_target_scan_and_compare(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb, skip_intel=args.skip_intel)
     elif args.compare:
         workflow_compare_existing(
             args.compare[0],
             args.compare[1],
             output_csv=args.output_csv,
             output_json=args.output_json,
-            output_html=args.output_html
+            output_html=args.output_html,
+            skip_intel=args.skip_intel
         )
     elif args.view:
         view_json_summary(args.view)
