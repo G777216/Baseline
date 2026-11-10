@@ -256,8 +256,25 @@ def scan_filesystem(start_path=None, output_file=None, verbose=True, compress=Fa
     return output_file
 
 # ----------------------------------------------------------------------
-# 2. Path Normalization & Diffing Engine
+# 2. Path Normalization, OS Detection & Diffing Engine
 # ----------------------------------------------------------------------
+
+def detect_scan_os(scan_data):
+    """
+    Detects whether scan data belongs to Windows or Linux by inspecting file paths.
+    """
+    if not scan_data:
+        return "windows" if os.name == "nt" else "linux"
+    
+    # Inspect first 50 entries
+    for item in scan_data[:50]:
+        path = item.get('full_path', '') or item.get('normalized_path', '')
+        if re.match(r'^[A-Za-z]:[\\/]', path) or '\\' in path or 'C:\\Users\\USER' in path:
+            return "windows"
+        if path.startswith('/') or '/home/USER' in path:
+            return "linux"
+            
+    return "windows" if os.name == "nt" else "linux"
 
 def normalize_path(path):
     """
@@ -287,7 +304,8 @@ def create_file_index(scan_data):
 def compare_scans(clean_scan_file, target_scan_file, output_file=None):
     """
     Compares baseline and target scans.
-    Identifies modified, new, deleted files, and permission anomalies (SUID).
+    Validates OS compatibility (Windows vs Linux) and identifies modified,
+    new, deleted files, and permission anomalies (SUID).
     """
     clean_data = load_json_scan(clean_scan_file)
     if clean_data is None:
@@ -296,6 +314,22 @@ def compare_scans(clean_scan_file, target_scan_file, output_file=None):
     target_data = load_json_scan(target_scan_file)
     if target_data is None:
         return None
+
+    # OS Compatibility Check
+    clean_os = detect_scan_os(clean_data)
+    target_os = detect_scan_os(target_data)
+
+    if clean_os != target_os:
+        print("\n" + "!"*75)
+        print(f"[-] INCOMPATIBLE OPERATING SYSTEM COMPARISON ERROR:")
+        print(f"    Baseline OS: {clean_os.upper()} ({clean_scan_file})")
+        print(f"    Target OS:   {target_os.upper()} ({target_scan_file})")
+        print(f"    Cannot compare a {clean_os.upper()} baseline against a {target_os.upper()} target.")
+        print(f"    Windows systems require 'clean_windows.json'; Linux requires 'clean_linux.json'.")
+        print("!"*75 + "\n")
+        return None
+
+    print(f"[*] Detected Compatible OS: {clean_os.upper()} for both scans.")
 
     clean_dict = create_file_index(clean_data)
     target_dict = create_file_index(target_data)
@@ -1347,69 +1381,95 @@ def generate_html_report(comparison_data, output_html):
     print(f"[+] Successfully generated Interactive HTML Report: {output_html}")
 
 # ----------------------------------------------------------------------
-# 6. Baseline File Discovery
+# 6. OS-Aware Baseline Discovery (Windows vs Linux)
 # ----------------------------------------------------------------------
 
-def find_clean_json():
-    """Locates clean.json or clean.json.gz in current directory or clean/ subdirectories."""
-    candidates = ["clean.json", "clean.json.gz"]
-    for c in candidates:
-        if os.path.exists(c):
-            print(f"[+] Found baseline '{c}' in current directory.")
-            return c
+def find_os_baseline(target_os=None):
+    """
+    Locates the appropriate baseline for the target OS (Windows vs Linux).
+    Looks for clean_windows.json(.gz) on Windows, clean_linux.json(.gz) on Linux.
+    Falls back to clean.json only if its internal paths match target_os.
+    """
+    if target_os is None:
+        target_os = "windows" if os.name == "nt" else "linux"
 
-    # Check clean/baseline/
-    for c in candidates:
-        sub_p = os.path.join("clean", "baseline", c)
-        if os.path.exists(sub_p):
-            print(f"[+] Found baseline at: {sub_p}")
-            return sub_p
+    os_names = [f"clean_{target_os}.json.gz", f"clean_{target_os}.json"]
 
-    # Recursive search in clean folder
-    if os.path.exists("clean"):
-        for root, dirs, files in os.walk("clean"):
-            for f in files:
-                if f in ("clean.json", "clean.json.gz"):
-                    found = os.path.join(root, f)
-                    print(f"[+] Found baseline at: {found}")
-                    return found
+    # 1. Exact OS-specific match in current directory
+    for name in os_names:
+        if os.path.exists(name):
+            print(f"[+] Found {target_os.upper()} baseline: '{name}' in current directory.")
+            return name, target_os
 
-    return None
+    # 2. Check clean/<os>/ or clean/baseline/
+    for name in os_names:
+        candidates = [
+            os.path.join("clean", target_os, name),
+            os.path.join("clean", "baseline", name),
+            os.path.join("clean", name)
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                print(f"[+] Found {target_os.upper()} baseline at: {c}")
+                return c, target_os
+
+    # 3. Fallback to generic clean.json(.gz) only if internal OS matches
+    generic_names = ["clean.json.gz", "clean.json"]
+    for g in generic_names:
+        candidates = [g, os.path.join("clean", "baseline", g), os.path.join("clean", g)]
+        for c in candidates:
+            if os.path.exists(c):
+                data = load_json_scan(c)
+                if data:
+                    internal_os = detect_scan_os(data)
+                    if internal_os == target_os:
+                        print(f"[*] Found generic baseline '{c}' matching {target_os.upper()} target.")
+                        return c, target_os
+                    else:
+                        print(f"[!] Skipped '{c}': Contains {internal_os.upper()} data, incompatible with {target_os.upper()} target.")
+
+    return None, target_os
 
 # ----------------------------------------------------------------------
 # 7. Workflow Procedures
 # ----------------------------------------------------------------------
 
-def workflow_baseline_scan(scan_path=None, compress=False, max_file_mb=None):
-    """Creates a fresh baseline scan snapshot."""
+def workflow_baseline_scan(scan_path=None, compress=False, max_file_mb=None, force_os=None):
+    """Creates a fresh OS-specific baseline snapshot (clean_windows or clean_linux)."""
+    current_os = force_os if force_os else ("windows" if os.name == "nt" else "linux")
     print("\n" + "="*70)
-    print("STEP 1: CREATING BASELINE SNAPSHOT (CLEAN STATE)".center(70))
+    print(f"STEP 1: CREATING {current_os.upper()} BASELINE SNAPSHOT (CLEAN STATE)".center(70))
     print("="*70)
+
     out_file = scan_filesystem(start_path=scan_path, compress=compress, max_file_mb=max_file_mb)
     if out_file and os.path.exists(out_file):
-        dest_name = "clean.json.gz" if (compress or out_file.endswith(".gz")) else "clean.json"
+        ext = ".json.gz" if (compress or out_file.endswith(".gz")) else ".json"
+        dest_name = f"clean_{current_os}{ext}"
         shutil.copy2(out_file, dest_name)
-        print(f"\n[+] Baseline snapshot created and saved as '{dest_name}' in current directory.")
+        print(f"\n[+] Successfully created '{dest_name}' (Baseline for {current_os.upper()} systems).")
         return dest_name
     else:
         print("\n[-] Error: Failed to generate baseline scan.")
         return None
 
-def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compress=False, max_file_mb=None, skip_intel=False):
-    """Runs target scan, compares against baseline, enriches with Threat Intel, and outputs CSV + HTML reports."""
+def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compress=False, max_file_mb=None, skip_intel=False, force_os=None):
+    """Runs target scan, selects matching OS baseline, compares, and outputs reports."""
+    target_os = force_os if force_os else ("windows" if os.name == "nt" else "linux")
     print("\n" + "="*70)
-    print("STEP 2: SCANNING TARGET SYSTEM & COMPARING WITH BASELINE".center(70))
+    print(f"STEP 2: SCANNING {target_os.upper()} TARGET & COMPARING WITH BASELINE".center(70))
     print("="*70)
 
     if not baseline_path:
-        baseline_path = find_clean_json()
+        baseline_path, _ = find_os_baseline(target_os=target_os)
 
     if not baseline_path:
-        print("[-] Error: Baseline scan 'clean.json' or 'clean.json.gz' not found!")
-        print("    Please run Option 1 first to create clean.json, or supply a baseline path.")
+        print(f"\n[-] Incompatible or Missing Baseline Error:")
+        print(f"    Target system is: {target_os.upper()}")
+        print(f"    Expected baseline: 'clean_{target_os}.json' or 'clean_{target_os}.json.gz'")
+        print(f"    Please create a clean_{target_os}.json baseline on your clean {target_os.upper()} system first.")
         return
 
-    print(f"[*] Active Baseline: {baseline_path}")
+    print(f"[*] Active Baseline: {baseline_path} (Target OS: {target_os.upper()})")
     target_scan_file = scan_filesystem(start_path=scan_path, verbose=True, compress=compress, max_file_mb=max_file_mb)
     if not target_scan_file or not os.path.exists(target_scan_file):
         print("[-] Target scan failed.")
@@ -1431,7 +1491,7 @@ def workflow_target_scan_and_compare(baseline_path=None, scan_path=None, compres
     print(f"[*] Comparing target scan against baseline...")
     comparison = compare_scans(baseline_path, target_json, output_file=compare_json)
     if not comparison:
-        print("[-] Comparison failed.")
+        print("[-] Comparison failed due to error or OS mismatch.")
         return
 
     if not skip_intel:
@@ -1485,7 +1545,8 @@ def view_json_summary(file_path):
     print("="*70)
 
     if isinstance(data, list):
-        print(f"Type: Raw Filesystem Scan")
+        detected_os = detect_scan_os(data)
+        print(f"Type: Raw Filesystem Scan ({detected_os.upper()})")
         print(f"Total Files Indexed: {len(data):,}")
         print("\nSample Entries (First 5):")
         for item in data[:5]:
@@ -1508,14 +1569,15 @@ def view_json_summary(file_path):
 # ----------------------------------------------------------------------
 
 def interactive_menu():
+    curr_os = "windows" if os.name == "nt" else "linux"
     while True:
         print("\n" + "="*75)
-        print("UNIFIED FILESYSTEM SCANNER AND INTEGRITY CHECKER (v2.0)".center(75))
+        print(f"UNIFIED FILESYSTEM SCANNER AND INTEGRITY CHECKER (v2.0 - {curr_os.upper()})".center(75))
         print("="*75)
-        print("  1. Create Clean Baseline Scan (clean.json or clean.json.gz)")
-        print("  2. Scan Target, Compare with Baseline, and Generate CSV + HTML Reports")
+        print(f"  1. Create Clean Baseline Scan (clean_{curr_os}.json / clean_{curr_os}.json.gz)")
+        print(f"  2. Scan Target & Compare against {curr_os.upper()} Baseline (Generate Reports)")
         print("  3. Scan Baseline & Target Sequentially (Benchmark / Demo)")
-        print("  4. Compare Two Existing JSON Scan Files (Generate Reports)")
+        print("  4. Compare Two Existing JSON Scan Files (Validates OS Compatibility)")
         print("  5. Inspect / View a Scan or Comparison JSON File")
         print("  6. Export Interactive HTML Report from an Existing Diff JSON")
         print("  7. Exit")
@@ -1528,7 +1590,7 @@ def interactive_menu():
             break
 
         if choice == '1':
-            custom = input("Enter path to scan (or press Enter for default root): ").strip()
+            custom = input(f"Enter path to scan (or press Enter for default root): ").strip()
             compress = input("Enable Gzip compression to save 85% disk space? [y/N]: ").strip().lower() == 'y'
             workflow_baseline_scan(scan_path=custom if custom else None, compress=compress)
         elif choice == '2':
@@ -1575,11 +1637,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Unified Filesystem Scanner and Integrity Checker (v2.0 Forensic Edition)"
     )
-    parser.add_argument("--baseline", action="store_true", help="Create baseline scan (clean.json or clean.json.gz)")
-    parser.add_argument("--target", action="store_true", help="Scan target and compare against clean baseline")
+    parser.add_argument("--baseline", action="store_true", help="Create baseline scan (clean_windows or clean_linux)")
+    parser.add_argument("--target", action="store_true", help="Scan target and compare against matching OS baseline")
     parser.add_argument("--compare", nargs=2, metavar=('CLEAN_JSON', 'TARGET_JSON'), help="Compare two scan JSON files")
     parser.add_argument("--view", metavar="JSON_FILE", help="View summary of a scan or comparison JSON")
     parser.add_argument("--path", help="Custom path to scan (defaults to C:\\ or /)")
+    parser.add_argument("--os", choices=['windows', 'linux'], help="Specify or force target operating system")
     parser.add_argument("--compress", action="store_true", help="Save scan snapshots with Gzip compression (.json.gz)")
     parser.add_argument("--max-size-mb", type=float, help="Cap hash hashing at max MB per file (skips massive ISO/VMDK)")
     parser.add_argument("--skip-intel", action="store_true", help="Skip Threat Intelligence lookups (offline mode)")
@@ -1592,9 +1655,9 @@ def main():
 
     # CLI Dispatch
     if args.baseline:
-        workflow_baseline_scan(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb)
+        workflow_baseline_scan(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb, force_os=args.os)
     elif args.target:
-        workflow_target_scan_and_compare(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb, skip_intel=args.skip_intel)
+        workflow_target_scan_and_compare(scan_path=args.path, compress=args.compress, max_file_mb=args.max_size_mb, skip_intel=args.skip_intel, force_os=args.os)
     elif args.compare:
         workflow_compare_existing(
             args.compare[0],

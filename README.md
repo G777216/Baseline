@@ -61,21 +61,22 @@ You will be presented with the menu:
 
 You can also run tasks directly from scripts or CI/CD pipelines:
 
-#### Create a Baseline Snapshot
+#### Create a Baseline Snapshot (OS-Aware)
 ```bash
-# Scan default system drive and save to clean.json
+# On Windows: Creates clean_windows.json
+# On Linux:   Creates clean_linux.json
 python unified_scanner.py --baseline
 
-# Create a compressed baseline snapshot (saves ~85% disk space)
+# Create a compressed baseline snapshot (saves ~85% disk space: clean_windows.json.gz or clean_linux.json.gz)
 python unified_scanner.py --baseline --compress
 
 # Scan a specific directory
 python unified_scanner.py --baseline --path /var/www --compress
 ```
 
-#### Audit a Target System against Baseline
+#### Audit a Target System against Baseline (OS-Aware)
 ```bash
-# Scans target, automatically locates clean.json / clean.json.gz, compares, and outputs reports:
+# Scans target, automatically selects matching clean_windows or clean_linux baseline, compares, and outputs reports:
 python unified_scanner.py --target
 
 # With compression enabled:
