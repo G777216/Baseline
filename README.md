@@ -147,7 +147,7 @@ flowchart TD
 2. Link your GitHub repository and push:
    ```bash
    git branch -M main
-   git remote add origin https://github.com/<YOUR_USERNAME>/<YOUR_REPOSITORY>.git
+   git remote add origin https://github.com/G777216/Baseline.git
    git push -u origin main
    ```
 
